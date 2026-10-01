@@ -61,6 +61,16 @@ python -m pytest tests/ -q
 - **待复核**：信任根换版、撤销快照切换或服务窗口增删后，相关已批准计划自动
   转为 `pending_review`；历史评估与历史批准（含冻结判定）全部保留，
   重新评估无断档后可再次批准。
+- **域名级窗口变更（预演 + 原子提交）**：换发证书时可按单个域名把
+  「撤下旧窗口 + 登记新窗口」组成一次变更。`POST /window-changes/preview`
+  只读预演：基于候选窗口集合，按每个相关计划当前选定的信任根及可选 CRL
+  快照重算，返回各计划变更前后的断档区间、阻断原因与提交校验标识
+  （`change_token`），不改动窗口、评估或批准历史。`POST /window-changes/commit`
+  须携带该标识：预演后域名窗口、相关计划状态或判定依据（信任根/快照选择）
+  已变化 → 409 拒绝过期预演；候选状态使任一当前已批准计划出现断档 → 409
+  整组拒绝、不产生部分变更；否则原子应用全部增删，相关已批准计划转待复核，
+  历史冻结批准保留。空变更/重复删除/跨域删除/无效区间 → 400；
+  未知窗口/证书指纹 → 404。
 - **离线撤销快照（可选）**：换发计划可选择一个不可变的带版本 PEM CRL 快照。
   导入时逐张验证签名（须由已导入的 CA 证书签署且带 `cRLSign`），拒绝重复版本、
   同一签发者的冲突列表与无法解析的内容。选择快照的计划在每次评估中，须为
@@ -91,6 +101,8 @@ python -m pytest tests/ -q
 | POST | `/service-windows` | 登记服务窗口 |
 | GET | `/service-windows?domain=` | 查询窗口 |
 | DELETE | `/service-windows/{id}` | 删除窗口（触发待复核） |
+| POST | `/window-changes/preview` | 预演域名级窗口变更（只读，返回前后断档/阻断原因/提交校验标识） |
+| POST | `/window-changes/commit` | 原子提交预演过的窗口变更（携带标识；过期或阻断 → 409） |
 | POST | `/plans` | 创建计划并立即评估（可带 `crl_snapshot_version`） |
 | GET | `/plans` / `/plans/{id}` | 查询计划（含最新评估与批准） |
 | POST | `/plans/{id}/evaluate` | 重新评估（可换信任根版本/快照；省略沿用，null 取消快照） |
@@ -246,6 +258,61 @@ curl -s -X POST http://localhost:8000/api/v1/plans/1/evaluate \
 # 省略该字段则沿用计划当前选择；取消后回到无快照的原始评估与响应语义
 ```
 
+### 10. 域名级窗口变更：预演 → 原子提交
+
+把「撤下旧窗口 + 登记新窗口」组成一次变更。预演只读，返回各相关计划
+变更前后的断档与提交校验标识；提交携带标识，原子应用全部增删。
+
+```bash
+# 10.1 预演：撤下 demo.example.com 的 current 窗口（id=1）且无接替
+curl -s -X POST http://localhost:8000/api/v1/window-changes/preview \
+  -H 'Content-Type: application/json' -d '{
+    "domain": "demo.example.com",
+    "delete_window_ids": [1]}'
+```
+
+响应（节选）：已批准计划 #1 变更后将出现断档 → 阻断原因；窗口/评估/批准
+历史均未被改动。
+
+```json
+{
+  "change_token": "wc1.98b2…",
+  "would_block": true,
+  "blocking_reasons": ["plan #1 is approved and the change would open 1 coverage gap(s): [2026-01-01T00:00:00.000Z, 2026-07-01T00:00:00.000Z)"],
+  "plans": [{"plan_id": 1, "status": "approved",
+             "before": {"has_gaps": false, "gaps": []},
+             "after":  {"has_gaps": true,  "gaps": [{"start": "2026-01-01T00:00:00.000Z", "end": "2026-07-01T00:00:00.000Z"}]}}]
+}
+```
+
+```bash
+# 10.2 预演：撤下旧窗口并登记等价接替窗口（证书指纹 FP 为已导入证书）
+FP=<current 证书指纹>
+PREV=$(curl -s -X POST http://localhost:8000/api/v1/window-changes/preview \
+  -H 'Content-Type: application/json' -d "{
+    \"domain\": \"demo.example.com\",
+    \"delete_window_ids\": [1],
+    \"add_windows\": [{\"certificate_fingerprint\": \"$FP\", \"role\": \"current\",
+                       \"start\": \"2026-01-01T00:00:00Z\", \"end\": \"2026-07-01T00:00:00Z\"}]}")
+TOKEN=$(echo "$PREV" | python3 -c "import json,sys;print(json.load(sys.stdin)['change_token'])")
+# would_block=false → 提交（标识原样带回，变更内容须与预演一致）
+curl -s -X POST http://localhost:8000/api/v1/window-changes/commit \
+  -H 'Content-Type: application/json' -d "{
+    \"domain\": \"demo.example.com\",
+    \"change_token\": \"$TOKEN\",
+    \"delete_window_ids\": [1],
+    \"add_windows\": [{\"certificate_fingerprint\": \"$FP\", \"role\": \"current\",
+                       \"start\": \"2026-01-01T00:00:00Z\", \"end\": \"2026-07-01T00:00:00Z\"}]}"
+# 200 → {"deleted_windows":[…], "created_windows":[…], "plans_marked_pending_review":1}
+# 已批准计划 #1 转 pending_review，历史冻结批准置 superseded 并保留；
+# 重新评估无断档后可再次批准（同第 6 节）。
+
+# 10.3 拒绝规则
+# - 预演后窗口/计划状态/判定依据变化，或提交内容与预演不一致 → 409 stale token
+# - 候选状态使任一已批准计划断档 → 409 且无任何部分变更
+# - 空变更/重复删除/跨域删除/无效区间 → 400；未知窗口/证书指纹 → 404
+```
+
 ## 项目结构
 
 ```
@@ -261,6 +328,6 @@ scripts/
   seed_demo.py  离线生成演示 CA/证书/CRL 并初始化演示数据（幂等）
   demo.sh       端到端 curl 调用示例
   docker-entrypoint.sh
-tests/          pytest 测试（55 例，覆盖全部拒绝规则、CRL 证据与复核流程）
+tests/          pytest 测试（72 例，覆盖全部拒绝规则、CRL 证据、复核流程与窗口变更预演/提交）
 Dockerfile / docker-compose.yml
 ```

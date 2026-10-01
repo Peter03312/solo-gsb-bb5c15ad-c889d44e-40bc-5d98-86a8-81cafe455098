@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -64,3 +64,30 @@ class EvaluateRequest(BaseModel):
     # 省略 → 沿用计划当前选择；显式 null → 取消快照、回到无快照语义；
     # 未知快照版本 → 404（不得静默按安全处理）。
     crl_snapshot_version: Optional[str] = Field(default=None, max_length=64)
+
+
+class WindowChangeAdd(BaseModel):
+    """一次域名级窗口变更中待登记的新窗口（域名由变更本身指定）。"""
+
+    certificate_fingerprint: str = Field(min_length=64, max_length=64)
+    role: Literal["current", "planned"]
+    start: datetime
+    end: datetime
+
+    _tz = field_validator("start", "end")(_require_tz_utc)
+
+
+class WindowChangePreview(BaseModel):
+    """按单个域名把「撤下旧窗口 + 登记新窗口」组成一次变更的预演请求。"""
+
+    domain: str = Field(min_length=1, max_length=253)
+    delete_window_ids: List[int] = Field(default_factory=list)
+    add_windows: List[WindowChangeAdd] = Field(default_factory=list)
+
+    _dom = field_validator("domain")(_norm_domain)
+
+
+class WindowChangeCommit(WindowChangePreview):
+    """提交预演过的窗口变更：必须携带预演返回的提交校验标识。"""
+
+    change_token: str = Field(min_length=1, max_length=128)

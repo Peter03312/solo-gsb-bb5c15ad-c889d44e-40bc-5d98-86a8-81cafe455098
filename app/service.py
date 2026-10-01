@@ -1,6 +1,7 @@
 """业务逻辑：信任根版本、证书链、服务窗口、CRL 撤销快照、评估计划与批准。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from datetime import datetime, timezone
@@ -803,7 +804,21 @@ def _assess_window(window, cert_row, roots, domain, eval_start, eval_end, snapsh
     return report, intervals
 
 
-def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_version) -> dict:
+def _compute_evaluation(
+    conn,
+    domain,
+    eval_start,
+    eval_end,
+    version,
+    snapshot_version,
+    windows=None,
+) -> dict:
+    """纯评估计算：读取信任根/快照/证书与窗口集合，不写入任何历史。
+
+    windows 为 None 时使用库中该域名的当前窗口集合；否则使用给定的候选
+    集合（元素为含 id/certificate_fingerprint/role/start_utc/end_utc 的
+    映射，候选新窗口的 id 为 None）。供计划评估与窗口变更预演共用。
+    """
     root_row = conn.execute(
         "SELECT * FROM trust_roots WHERE version = ?", (version,)
     ).fetchone()
@@ -811,10 +826,11 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
         raise ApiError(404, f"unknown trust root version '{version}'")
     roots = certutils.parse_pem_chain(root_row["pem"])
     snapshot = _load_snapshot(conn, snapshot_version)
-    windows = conn.execute(
-        "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
-        (domain,),
-    ).fetchall()
+    if windows is None:
+        windows = conn.execute(
+            "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
+            (domain,),
+        ).fetchall()
 
     usable: list[tuple[datetime, datetime]] = []
     reports = []
@@ -830,7 +846,7 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
         reports.append(report)
 
     gaps = coverage.compute_gaps(eval_start, eval_end, usable)
-    result = {
+    return {
         "domain": domain,
         "eval_start": iso_z(eval_start),
         "eval_end": iso_z(eval_end),
@@ -841,6 +857,13 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
         "certificates": reports,
         "evaluated_at": iso_z(now_utc()),
     }
+
+
+def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_version) -> dict:
+    """评估计划并写入评估历史（窗口变更预演复用 _compute_evaluation，不写历史）。"""
+    result = _compute_evaluation(
+        conn, domain, eval_start, eval_end, version, snapshot_version
+    )
     conn.execute(
         "INSERT INTO evaluations (plan_id, trust_root_version, crl_snapshot_version,"
         " has_gaps, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -848,7 +871,7 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
             plan_id,
             version,
             snapshot_version,
-            1 if gaps else 0,
+            1 if result["has_gaps"] else 0,
             json.dumps(result),
             iso_z(now_utc()),
         ),
@@ -1097,3 +1120,276 @@ def list_approvals(plan_id: int) -> list[dict]:
             "SELECT * FROM approvals WHERE plan_id = ? ORDER BY id", (plan_id,)
         ).fetchall()
     return [_approval_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 域名级窗口变更（预演 + 原子提交）
+# ---------------------------------------------------------------------------
+
+def _candidate_windows(conn, domain: str, delete_ids: set[int], adds: list[dict]) -> list[dict]:
+    """当前窗口集合应用增删后的候选集合（候选新窗口的 id 为 None）。"""
+    rows = conn.execute(
+        "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
+        (domain,),
+    ).fetchall()
+    candidates: list[dict] = [
+        {
+            "id": r["id"],
+            "domain": r["domain"],
+            "certificate_fingerprint": r["certificate_fingerprint"],
+            "role": r["role"],
+            "start_utc": r["start_utc"],
+            "end_utc": r["end_utc"],
+        }
+        for r in rows
+        if r["id"] not in delete_ids
+    ]
+    for add in adds:
+        candidates.append(
+            {
+                "id": None,
+                "domain": domain,
+                "certificate_fingerprint": add["fingerprint"],
+                "role": add["role"],
+                "start_utc": iso_z(add["start"]),
+                "end_utc": iso_z(add["end"]),
+            }
+        )
+    candidates.sort(key=lambda w: (w["start_utc"], w["id"] is None, w["id"] or 0))
+    return candidates
+
+
+def _validate_window_change(conn, domain: str, delete_ids: list[int], adds: list[dict]):
+    """校验变更集，返回 (待删除窗口行列表, 候选窗口集合)。
+
+    空变更/重复删除/跨域删除/无效区间 → 400；未知窗口/证书指纹 → 404。
+    """
+    if not delete_ids and not adds:
+        raise ApiError(400, "empty window change: nothing to delete or add")
+    seen: set[int] = set()
+    dups: list[int] = []
+    for wid in delete_ids:
+        if wid in seen and wid not in dups:
+            dups.append(wid)
+        seen.add(wid)
+    if dups:
+        raise ApiError(400, f"duplicate delete window id(s): {sorted(dups)}")
+    deleted = []
+    for wid in delete_ids:
+        row = conn.execute(
+            "SELECT * FROM service_windows WHERE id = ?", (wid,)
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, f"unknown service window id {wid}")
+        if row["domain"] != domain:
+            raise ApiError(
+                400,
+                f"service window id {wid} belongs to domain '{row['domain']}';"
+                f" a window change is scoped to a single domain ('{domain}')",
+            )
+        deleted.append(row)
+    for add in adds:
+        if add["start"] >= add["end"]:
+            raise ApiError(
+                400,
+                "invalid time window: start "
+                f"{iso_z(add['start'])} must be before end {iso_z(add['end'])}",
+            )
+        if not conn.execute(
+            "SELECT 1 FROM certificates WHERE fingerprint_sha256 = ?",
+            (add["fingerprint"],),
+        ).fetchone():
+            raise ApiError(
+                404, f"unknown certificate fingerprint '{add['fingerprint']}'"
+            )
+    return deleted, _candidate_windows(conn, domain, set(delete_ids), adds)
+
+
+def _window_change_token(conn, domain: str, delete_ids: list[int], adds: list[dict]) -> str:
+    """提交校验标识：绑定变更内容与预演时的判定依据。
+
+    判定依据 = 该域名当前窗口集合 + 相关计划的状态及其当前选定的
+    信任根版本 / CRL 快照版本。预演后任一变化（窗口增删、计划状态流转、
+    重选信任根或快照、相关计划增删）都会使标识失效，提交被拒绝。
+    """
+    windows = conn.execute(
+        "SELECT * FROM service_windows WHERE domain = ? ORDER BY id", (domain,)
+    ).fetchall()
+    plans = conn.execute(
+        "SELECT * FROM plans WHERE domain = ? ORDER BY id", (domain,)
+    ).fetchall()
+    material = {
+        "domain": domain,
+        "change": {
+            "delete_window_ids": sorted(delete_ids),
+            "add_windows": sorted(
+                [a["fingerprint"], a["role"], iso_z(a["start"]), iso_z(a["end"])]
+                for a in adds
+            ),
+        },
+        "windows": [
+            [w["id"], w["certificate_fingerprint"], w["role"],
+             w["start_utc"], w["end_utc"]]
+            for w in windows
+        ],
+        "plans": [
+            [p["id"], p["status"], p["trust_root_version"],
+             p["crl_snapshot_version"], p["eval_start"], p["eval_end"]]
+            for p in plans
+        ],
+    }
+    blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return "wc1." + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _blocking_reasons(conn, domain: str, candidates: list[dict]) -> list[str]:
+    """候选窗口集合下，当前已批准计划会出现的断档（整组阻断原因）。"""
+    reasons: list[str] = []
+    plans = conn.execute(
+        "SELECT * FROM plans WHERE domain = ? AND status = 'approved' ORDER BY id",
+        (domain,),
+    ).fetchall()
+    for p in plans:
+        after = _compute_evaluation(
+            conn,
+            domain,
+            parse_ts(p["eval_start"]),
+            parse_ts(p["eval_end"]),
+            p["trust_root_version"],
+            p["crl_snapshot_version"],
+            windows=candidates,
+        )
+        if after["has_gaps"]:
+            gap_str = ", ".join(
+                f"[{g['start']}, {g['end']})" for g in after["gaps"]
+            )
+            reasons.append(
+                f"plan #{p['id']} is approved and the change would open"
+                f" {len(after['gaps'])} coverage gap(s): {gap_str}"
+            )
+    return reasons
+
+
+def preview_window_change(domain: str, delete_ids: list[int], adds: list[dict]) -> dict:
+    """预演一次域名级窗口变更（只读：不改动窗口、评估或批准历史）。
+
+    基于候选窗口集合，按每个相关计划当前选定的信任根版本与可选 CRL
+    快照重算变更前后的断档；返回逐计划对比、阻断原因与提交校验标识。
+    """
+    with db.connect() as conn:
+        deleted, candidates = _validate_window_change(conn, domain, delete_ids, adds)
+        plans = conn.execute(
+            "SELECT * FROM plans WHERE domain = ? ORDER BY id", (domain,)
+        ).fetchall()
+        plan_reports = []
+        blocking: list[str] = []
+        for p in plans:
+            eval_start, eval_end = parse_ts(p["eval_start"]), parse_ts(p["eval_end"])
+            before = _compute_evaluation(
+                conn, domain, eval_start, eval_end,
+                p["trust_root_version"], p["crl_snapshot_version"],
+            )
+            after = _compute_evaluation(
+                conn, domain, eval_start, eval_end,
+                p["trust_root_version"], p["crl_snapshot_version"],
+                windows=candidates,
+            )
+            reasons: list[str] = []
+            if p["status"] == "approved" and after["has_gaps"]:
+                gap_str = ", ".join(
+                    f"[{g['start']}, {g['end']})" for g in after["gaps"]
+                )
+                reasons.append(
+                    f"plan #{p['id']} is approved and the change would open"
+                    f" {len(after['gaps'])} coverage gap(s): {gap_str}"
+                )
+                blocking.extend(reasons)
+            plan_reports.append(
+                {
+                    "plan_id": p["id"],
+                    "status": p["status"],
+                    "trust_root_version": p["trust_root_version"],
+                    "crl_snapshot_version": p["crl_snapshot_version"],
+                    "before": before,
+                    "after": after,
+                    "blocking_reasons": reasons,
+                }
+            )
+        token = _window_change_token(conn, domain, delete_ids, adds)
+    return {
+        "domain": domain,
+        "change_token": token,
+        "would_block": bool(blocking),
+        "blocking_reasons": blocking,
+        "delete_windows": [_window_dict(r) for r in deleted],
+        "add_windows": [
+            {
+                "certificate_fingerprint": a["fingerprint"],
+                "role": a["role"],
+                "start": iso_z(a["start"]),
+                "end": iso_z(a["end"]),
+            }
+            for a in adds
+        ],
+        "plans": plan_reports,
+    }
+
+
+def commit_window_change(
+    domain: str, change_token: str, delete_ids: list[int], adds: list[dict]
+) -> dict:
+    """原子提交一次经预演的窗口变更。
+
+    - 预演后域名窗口、相关计划状态或判定依据已变化（标识失效）→ 409；
+    - 候选状态使任一当前已批准计划出现断档 → 409，整组拒绝、无部分变更；
+    - 否则同一事务内应用全部增删，相关已批准计划转待复核，
+      历史冻结批准置 superseded 并完整保留。
+    """
+    with _write_lock, db.connect() as conn:
+        deleted, candidates = _validate_window_change(conn, domain, delete_ids, adds)
+        current_token = _window_change_token(conn, domain, delete_ids, adds)
+        if change_token != current_token:
+            raise ApiError(
+                409,
+                "stale or mismatched preview token: windows, related plan status"
+                " or decision basis changed since the preview (or the change"
+                " differs from the previewed one); run preview again",
+            )
+        blocking = _blocking_reasons(conn, domain, candidates)
+        if blocking:
+            raise ApiError(
+                409,
+                "window change rejected, no changes applied: " + "; ".join(blocking),
+            )
+        ts = iso_z(now_utc())
+        for row in deleted:
+            conn.execute("DELETE FROM service_windows WHERE id = ?", (row["id"],))
+        created = []
+        for add in adds:
+            cur = conn.execute(
+                "INSERT INTO service_windows"
+                " (domain, certificate_fingerprint, role, start_utc, end_utc, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    domain,
+                    add["fingerprint"],
+                    add["role"],
+                    iso_z(add["start"]),
+                    iso_z(add["end"]),
+                    ts,
+                ),
+            )
+            created.append(
+                _window_dict(
+                    conn.execute(
+                        "SELECT * FROM service_windows WHERE id = ?", (cur.lastrowid,)
+                    ).fetchone()
+                )
+            )
+        affected = _mark_domain_plans_pending_review(conn, domain)
+    return {
+        "domain": domain,
+        "deleted_windows": [_window_dict(r) for r in deleted],
+        "created_windows": created,
+        "plans_marked_pending_review": affected,
+    }

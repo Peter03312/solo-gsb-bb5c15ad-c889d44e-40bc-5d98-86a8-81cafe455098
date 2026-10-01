@@ -14,6 +14,8 @@ from .models import (
     PlanCreate,
     ServiceWindowCreate,
     TrustRootImport,
+    WindowChangeCommit,
+    WindowChangePreview,
 )
 
 API = "/api/v1"
@@ -141,6 +143,47 @@ def list_service_windows(domain: str | None = Query(default=None)):
 @app.delete(f"{API}/service-windows/{{window_id}}", tags=["service-windows"])
 def delete_service_window(window_id: int):
     return service.delete_window(window_id)
+
+
+# ----------------------------- 域名级窗口变更（预演 + 原子提交） -----------------------------
+
+def _change_adds(body) -> list[dict]:
+    return [
+        {
+            "fingerprint": a.certificate_fingerprint,
+            "role": a.role,
+            "start": a.start,
+            "end": a.end,
+        }
+        for a in body.add_windows
+    ]
+
+
+@app.post(f"{API}/window-changes/preview", tags=["window-changes"])
+def preview_window_change(body: WindowChangePreview):
+    """预演一次域名级窗口变更（只读，不改动窗口/评估/批准历史）。
+
+    输入待删除窗口 ID 与待登记窗口（证书指纹、角色、带时区起止时间），
+    基于候选窗口集合按每个相关计划当前选定的信任根及可选 CRL 快照重算，
+    返回各计划变更前后的断档区间、阻断原因与提交校验标识。
+    空变更/重复删除/跨域删除/无效区间 → 400；未知窗口/证书指纹 → 404。
+    """
+    return service.preview_window_change(
+        body.domain, body.delete_window_ids, _change_adds(body)
+    )
+
+
+@app.post(f"{API}/window-changes/commit", tags=["window-changes"])
+def commit_window_change(body: WindowChangeCommit):
+    """原子提交一次经预演的窗口变更（须携带预演返回的 change_token）。
+
+    预演后域名窗口、相关计划状态或判定依据已变化 → 409（过期预演）；
+    候选状态使任一当前已批准计划出现断档 → 409，整组拒绝、无部分变更；
+    否则原子应用全部增删，相关已批准计划转待复核，历史冻结批准保留。
+    """
+    return service.commit_window_change(
+        body.domain, body.change_token, body.delete_window_ids, _change_adds(body)
+    )
 
 
 # ----------------------------- 计划 / 评估 / 批准 -----------------------------

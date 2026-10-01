@@ -105,4 +105,56 @@ PYEOF
 printf '%s' "$GOOD_PEM" | curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/crl-snapshots" \
   -H 'Content-Type: application/json' -d @-
 
+echo "==> 12. 域名级窗口变更：预演 → 原子提交"
+CUR_WIN=$(curl -s "$BASE/service-windows?domain=demo.example.com" \
+  | python3 -c "import json,sys;print([w['id'] for w in json.load(sys.stdin)['items'] if w['role']=='current'][0])")
+CUR_FP=$(curl -s "$BASE/service-windows?domain=demo.example.com" \
+  | python3 -c "import json,sys;print([w['certificate_fingerprint'] for w in json.load(sys.stdin)['items'] if w['role']=='current'][0])")
+
+echo "-- 12.1 预演：只撤下 current 窗口（已批准计划将断档 → 阻断；预演只读）"
+PREV=$(curl -s -X POST "$BASE/window-changes/preview" -H 'Content-Type: application/json' \
+  -d "{\"domain\":\"demo.example.com\",\"delete_window_ids\":[$CUR_WIN]}")
+echo "$PREV" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print('would_block =', d['would_block'])
+print('blocking    =', d['blocking_reasons'])
+for p in d['plans']:
+    print(f\"  plan #{p['plan_id']} ({p['status']}): before gaps={p['before']['gaps']} after gaps={p['after']['gaps']}\")"
+
+echo "-- 12.2 直接提交该变更（应 409 整组拒绝，窗口无变化）"
+TOKEN=$(echo "$PREV" | python3 -c "import json,sys;print(json.load(sys.stdin)['change_token'])")
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/window-changes/commit" \
+  -H 'Content-Type: application/json' \
+  -d "{\"domain\":\"demo.example.com\",\"change_token\":\"$TOKEN\",\"delete_window_ids\":[$CUR_WIN]}"
+
+echo "-- 12.3 预演：撤下旧窗口并登记等价接替窗口 → 提交（原子应用，已批准计划转待复核）"
+PREV=$(curl -s -X POST "$BASE/window-changes/preview" -H 'Content-Type: application/json' -d "{
+  \"domain\":\"demo.example.com\",
+  \"delete_window_ids\":[$CUR_WIN],
+  \"add_windows\":[{\"certificate_fingerprint\":\"$CUR_FP\",\"role\":\"current\",
+                    \"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-07-01T00:00:00Z\"}]}")
+echo "$PREV" | python3 -c "import json,sys;print('would_block =', json.load(sys.stdin)['would_block'])"
+TOKEN=$(echo "$PREV" | python3 -c "import json,sys;print(json.load(sys.stdin)['change_token'])")
+curl -s -X POST "$BASE/window-changes/commit" -H 'Content-Type: application/json' -d "{
+  \"domain\":\"demo.example.com\",
+  \"change_token\":\"$TOKEN\",
+  \"delete_window_ids\":[$CUR_WIN],
+  \"add_windows\":[{\"certificate_fingerprint\":\"$CUR_FP\",\"role\":\"current\",
+                    \"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-07-01T00:00:00Z\"}]}" | $JQ
+curl -s "$BASE/plans/1" | python3 -c "import json,sys;print('plan 1 status =', json.load(sys.stdin)['status'])"
+
+echo "-- 12.4 预演后计划状态/判定依据变化 → 旧标识提交应 409（过期预演）"
+CUR_WIN=$(curl -s "$BASE/service-windows?domain=demo.example.com" \
+  | python3 -c "import json,sys;print([w['id'] for w in json.load(sys.stdin)['items'] if w['role']=='current'][0])")
+TOKEN=$(curl -s -X POST "$BASE/window-changes/preview" -H 'Content-Type: application/json' \
+  -d "{\"domain\":\"demo.example.com\",\"delete_window_ids\":[$CUR_WIN],\"add_windows\":[{\"certificate_fingerprint\":\"$CUR_FP\",\"role\":\"current\",\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-07-01T00:00:00Z\"}]}" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['change_token'])")
+# 预演后复核并重新批准计划（状态变化）→ 标识失效
+curl -s -X POST "$BASE/plans/1/evaluate" > /dev/null
+curl -s -X POST "$BASE/plans/1/approve" > /dev/null
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/window-changes/commit" \
+  -H 'Content-Type: application/json' \
+  -d "{\"domain\":\"demo.example.com\",\"change_token\":\"$TOKEN\",\"delete_window_ids\":[$CUR_WIN],\"add_windows\":[{\"certificate_fingerprint\":\"$CUR_FP\",\"role\":\"current\",\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-07-01T00:00:00Z\"}]}"
+
 echo "demo done."
