@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS crl_entries (
 CREATE INDEX IF NOT EXISTS idx_crl_entries_snapshot ON crl_entries(snapshot_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_crl_entries_issuer
     ON crl_entries(snapshot_id, issuer_dn, issuer_key_id);
+
+-- 键值元数据：存放窗口变更预演提交令牌的 HMAC 密钥等单值配置
+CREATE TABLE IF NOT EXISTS app_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
 """
 
 # 既有库的轻量迁移：计划/评估/批准各增加撤销快照版本列（NULL = 未选择快照，

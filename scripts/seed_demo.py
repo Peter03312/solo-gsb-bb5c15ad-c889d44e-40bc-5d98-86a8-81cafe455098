@@ -3,6 +3,8 @@
 - 信任根版本 demo-root-v1（自动激活）
 - demo.example.com：现用 + 拟启用证书，窗口首尾相接，无断档 → 计划创建并批准
 - demo-gap.example.com：两窗口之间留有 14 天断档 → 计划保持 pending，演示断档报告
+- renew-demo.example.com：独立的换发演练域（计划已批准），供
+  /domains/{domain}/window-change 的预演→提交演示使用，不受前面各步骤增删影响
 
 幂等：若 demo-root-v1 已存在则跳过。
 """
@@ -216,6 +218,42 @@ def main() -> None:
             print(f"[seed] {domain}: plan #{plan_id} approved")
         else:
             print(f"[seed] {domain}: plan #{plan_id} left pending (gaps exist)")
+
+    # 独立的换发演练域：现用证书 + 拟启用证书首尾相接、计划已批准。
+    # 拟启用证书 2026-06-01 即生效，供窗口变更演示：
+    #   预演把它提前到 2026-06-15 开始会留出年初断档（整组阻断）；
+    #   提前到 2026-06-01 开始则与现用窗口重叠、无断档，可原子提交。
+    renew_domain = "renew-demo.example.com"
+    renew_cur, _ = make_leaf(root, root_key, renew_domain,
+                             t("2026-01-01"), t("2026-08-01"))
+    renew_next, _ = make_leaf(root, root_key, renew_domain,
+                              t("2026-06-01"), t("2027-02-01"))
+    # 新换发证书：覆盖整个评估区间，初始不登记任何窗口；预演成功路径中
+    # 用它替换现用窗口 [2026-01-01, 2026-07-01)，替换后无断档可原子提交。
+    renew_new, _ = make_leaf(root, root_key, renew_domain,
+                             t("2025-12-01"), t("2027-06-01"))
+    renew_cur_fp = service.import_certificate(
+        pem(renew_cur), f"{renew_domain}-current"
+    )["fingerprint_sha256"]
+    renew_next_fp = service.import_certificate(
+        pem(renew_next), f"{renew_domain}-planned"
+    )["fingerprint_sha256"]
+    service.import_certificate(pem(renew_new), f"{renew_domain}-renewal")
+    service.create_window(
+        renew_domain, renew_cur_fp, "current", t("2026-01-01"), t("2026-07-01")
+    )
+    service.create_window(
+        renew_domain, renew_next_fp, "planned", t("2026-07-01"), t("2027-01-01")
+    )
+    renew_created = service.create_plan(
+        renew_domain, t("2026-01-01"), t("2027-01-01"), None
+    )
+    renew_plan_id = renew_created["plan"]["id"]
+    service.approve_plan(renew_plan_id)
+    print(
+        f"[seed] {renew_domain}: plan #{renew_plan_id} approved"
+        " (window-change demo domain)"
+    )
 
     # 两个不可变的离线撤销快照（默认不绑定任何计划，仅供演示选用）：
     # - demo-crl-2026Q1：CRL 覆盖整个评估区间且无撤销 → 选用后仍无断档

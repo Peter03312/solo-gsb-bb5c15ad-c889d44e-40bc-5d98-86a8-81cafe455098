@@ -105,4 +105,74 @@ PYEOF
 printf '%s' "$GOOD_PEM" | curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/crl-snapshots" \
   -H 'Content-Type: application/json' -d @-
 
+echo "==> 12. 按域名成组换发：预演 → 提交（独立演练域 renew-demo.example.com，计划 #3 已批准）"
+echo "-- 12.1 取出现用窗口 ID 与拟启用证书指纹"
+CUR_ID=$(curl -s "$BASE/service-windows?domain=renew-demo.example.com" \
+  | python3 -c "import json,sys;print(next(w['id'] for w in json.load(sys.stdin)['items'] if w['role']=='current'))")
+PLAN_FP=$(curl -s "$BASE/service-windows?domain=renew-demo.example.com" \
+  | python3 -c "import json,sys;print(next(w['certificate_fingerprint'] for w in json.load(sys.stdin)['items'] if w['role']=='planned'))")
+echo "   current window id = $CUR_ID, planned cert fp = ${PLAN_FP:0:12}…"
+# 新换发证书（已导入但未登记窗口），覆盖整个评估区间，用于成功提交路径
+NEW_FP=$(curl -s "$BASE/certificates" \
+  | python3 -c "import json,sys;print(next(c['fingerprint_sha256'] for c in json.load(sys.stdin)['items'] if c['label']=='renew-demo.example.com-renewal'))")
+echo "   renewal cert fp = ${NEW_FP:0:12}…（已导入、初始无窗口）"
+
+echo "-- 12.2 预演：撤下现用窗口，用拟启用证书提前到 2026-06-15 开始（证书 06-01 才生效 → 年初断档，阻断）"
+PREVIEW_BLOCKED=$(curl -s -X POST "$BASE/domains/renew-demo.example.com/window-change/preview" \
+  -H 'Content-Type: application/json' -d "{
+    \"domain\": \"renew-demo.example.com\",
+    \"delete_window_ids\": [$CUR_ID],
+    \"add_windows\": [{
+      \"certificate_fingerprint\": \"$PLAN_FP\", \"role\": \"current\",
+      \"start\": \"2026-06-15T00:00:00Z\", \"end\": \"2026-07-01T00:00:00Z\"
+    }]}")
+echo "$PREVIEW_BLOCKED" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);p=d['plans'][0];print('blocked =',d['blocked'],'| after gaps =',p['after']['gaps'])"
+TOKEN_BLOCKED=$(echo "$PREVIEW_BLOCKED" | python3 -c "import json,sys;print(json.load(sys.stdin)['commit_token'])")
+echo "-- 12.3 携带该预演令牌提交（应整组 409 拒绝，无部分变更）"
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/domains/renew-demo.example.com/window-change/commit" \
+  -H 'Content-Type: application/json' -d "{
+    \"domain\": \"renew-demo.example.com\",
+    \"delete_window_ids\": [$CUR_ID],
+    \"add_windows\": [{
+      \"certificate_fingerprint\": \"$PLAN_FP\", \"role\": \"current\",
+      \"start\": \"2026-06-15T00:00:00Z\", \"end\": \"2026-07-01T00:00:00Z\"
+    }],
+    \"commit_token\": \"$TOKEN_BLOCKED\"}"
+
+echo "-- 12.4 重新预演：撤下现用窗口、换上覆盖全年的新换发证书（无断档）→ 提交成功"
+PREVIEW_OK=$(curl -s -X POST "$BASE/domains/renew-demo.example.com/window-change/preview" \
+  -H 'Content-Type: application/json' -d "{
+    \"domain\": \"renew-demo.example.com\",
+    \"delete_window_ids\": [$CUR_ID],
+    \"add_windows\": [{
+      \"certificate_fingerprint\": \"$NEW_FP\", \"role\": \"current\",
+      \"start\": \"2026-01-01T00:00:00Z\", \"end\": \"2026-07-01T00:00:00Z\"
+    }]}")
+echo "$PREVIEW_OK" | python3 -c "import json,sys;d=json.load(sys.stdin);print('blocked =',d['blocked'])"
+TOKEN_OK=$(echo "$PREVIEW_OK" | python3 -c "import json,sys;print(json.load(sys.stdin)['commit_token'])")
+curl -s -X POST "$BASE/domains/renew-demo.example.com/window-change/commit" \
+  -H 'Content-Type: application/json' -d "{
+    \"domain\": \"renew-demo.example.com\",
+    \"delete_window_ids\": [$CUR_ID],
+    \"add_windows\": [{
+      \"certificate_fingerprint\": \"$NEW_FP\", \"role\": \"current\",
+      \"start\": \"2026-01-01T00:00:00Z\", \"end\": \"2026-07-01T00:00:00Z\"
+    }],
+    \"commit_token\": \"$TOKEN_OK\"}" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print('applied =',d['applied'],'| deleted =',[w['id'] for w in d['deleted_windows']],'| added =',[w['id'] for w in d['added_windows']],'| plans_marked_pending_review =',d['plans_marked_pending_review'])"
+
+echo "-- 12.5 同一令牌重复提交（应 409 过期；冻结批准历史仍保留）"
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/domains/renew-demo.example.com/window-change/commit" \
+  -H 'Content-Type: application/json' -d "{
+    \"domain\": \"renew-demo.example.com\", \"delete_window_ids\": [$CUR_ID],
+    \"add_windows\": [{
+      \"certificate_fingerprint\": \"$NEW_FP\", \"role\": \"current\",
+      \"start\": \"2026-01-01T00:00:00Z\", \"end\": \"2026-07-01T00:00:00Z\"
+    }],
+    \"commit_token\": \"$TOKEN_OK\"}"
+curl -s "$BASE/plans/3" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print('plan status =',d['status'])"
+curl -s "$BASE/plans/3/approvals" | python3 -c "import json,sys;a=json.load(sys.stdin)['items'];print('approvals kept =',len(a),'| superseded flags =',[x['superseded'] for x in a])"
+
 echo "demo done."

@@ -1,7 +1,11 @@
 """业务逻辑：信任根版本、证书链、服务窗口、CRL 撤销快照、评估计划与批准。"""
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+import secrets
 import threading
 from datetime import datetime, timezone
 
@@ -803,7 +807,20 @@ def _assess_window(window, cert_row, roots, domain, eval_start, eval_end, snapsh
     return report, intervals
 
 
-def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_version) -> dict:
+def _compute_evaluation(
+    conn,
+    domain,
+    eval_start,
+    eval_end,
+    version,
+    snapshot_version,
+    windows_override=None,
+) -> dict:
+    """纯计算：按给定信任根版本与可选 CRL 快照评估域名窗口覆盖情况。
+
+    windows_override 非空时使用候选窗口集合（窗口变更预演用，不落库）；
+    元素需与 service_windows 行同样提供下标访问。不写评估历史。
+    """
     root_row = conn.execute(
         "SELECT * FROM trust_roots WHERE version = ?", (version,)
     ).fetchone()
@@ -811,10 +828,13 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
         raise ApiError(404, f"unknown trust root version '{version}'")
     roots = certutils.parse_pem_chain(root_row["pem"])
     snapshot = _load_snapshot(conn, snapshot_version)
-    windows = conn.execute(
-        "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
-        (domain,),
-    ).fetchall()
+    if windows_override is not None:
+        windows = windows_override
+    else:
+        windows = conn.execute(
+            "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
+            (domain,),
+        ).fetchall()
 
     usable: list[tuple[datetime, datetime]] = []
     reports = []
@@ -830,7 +850,7 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
         reports.append(report)
 
     gaps = coverage.compute_gaps(eval_start, eval_end, usable)
-    result = {
+    return {
         "domain": domain,
         "eval_start": iso_z(eval_start),
         "eval_end": iso_z(eval_end),
@@ -841,6 +861,13 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
         "certificates": reports,
         "evaluated_at": iso_z(now_utc()),
     }
+
+
+def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_version) -> dict:
+    """评估并写入评估历史（计划创建/重评使用）。"""
+    result = _compute_evaluation(
+        conn, domain, eval_start, eval_end, version, snapshot_version
+    )
     conn.execute(
         "INSERT INTO evaluations (plan_id, trust_root_version, crl_snapshot_version,"
         " has_gaps, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -848,7 +875,7 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_ver
             plan_id,
             version,
             snapshot_version,
-            1 if gaps else 0,
+            1 if result["has_gaps"] else 0,
             json.dumps(result),
             iso_z(now_utc()),
         ),
@@ -1097,3 +1124,432 @@ def list_approvals(plan_id: int) -> list[dict]:
             "SELECT * FROM approvals WHERE plan_id = ? ORDER BY id", (plan_id,)
         ).fetchall()
     return [_approval_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 按域名成组窗口变更：预演 → 原子提交
+# ---------------------------------------------------------------------------
+
+_META_HMAC_KEY = "window_change_hmac_secret"
+
+
+def _hmac_secret(conn) -> bytes:
+    """取（必要时惰性生成）预演提交令牌的服务器端 HMAC 密钥。
+
+    该密钥仅写入 app_meta，不属于窗口/评估/批准历史，不影响业务数据。
+    """
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = ?", (_META_HMAC_KEY,)
+    ).fetchone()
+    if row is not None:
+        return row["value"].encode("ascii")
+    secret = secrets.token_hex(32)
+    conn.execute(
+        "INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)",
+        (_META_HMAC_KEY, secret),
+    )
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = ?", (_META_HMAC_KEY,)
+    ).fetchone()
+    return row["value"].encode("ascii")
+
+
+def _b64e(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64d(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _canonical_change(domain: str, delete_ids: list[int], add_windows) -> bytes:
+    """变更请求的规范化载荷（时间统一为 UTC 毫秒 Z，删除 ID 排序）。"""
+    payload = {
+        "domain": domain,
+        "delete_window_ids": sorted(set(delete_ids)),
+        "add_windows": [
+            {
+                "certificate_fingerprint": w[0].lower(),
+                "role": w[1],
+                "start": iso_z(w[2]),
+                "end": iso_z(w[3]),
+            }
+            for w in add_windows
+        ],
+    }
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _window_state_hash(conn, domain: str) -> str:
+    rows = conn.execute(
+        "SELECT id, certificate_fingerprint, role, start_utc, end_utc"
+        " FROM service_windows WHERE domain = ? ORDER BY id",
+        (domain,),
+    ).fetchall()
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(
+            f"{r['id']}|{r['certificate_fingerprint']}|{r['role']}|"
+            f"{r['start_utc']}|{r['end_utc']}\n".encode("utf-8")
+        )
+    return h.hexdigest()
+
+
+def _plan_state_hash(conn, domain: str) -> str:
+    # 仅纳入会改变判定前提或需触发待复核的字段；纯重评（只更新评估历史与
+    # updated_at）不使未提交预演失效。
+    rows = conn.execute(
+        "SELECT id, status, trust_root_version, crl_snapshot_version,"
+        " eval_start, eval_end FROM plans WHERE domain = ? ORDER BY id",
+        (domain,),
+    ).fetchall()
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(
+            f"{r['id']}|{r['status']}|{r['trust_root_version']}|"
+            f"{r['crl_snapshot_version']}|{r['eval_start']}|{r['eval_end']}\n"
+            .encode("utf-8")
+        )
+    return h.hexdigest()
+
+
+def _issue_change_token(
+    conn,
+    domain: str,
+    delete_ids: list[int],
+    add_windows,
+    window_hash: str,
+    plan_hash: str,
+) -> str:
+    claims = {
+        "d": domain,
+        "p": _canonical_change(domain, delete_ids, add_windows).decode("utf-8"),
+        "w": window_hash,
+        "pl": plan_hash,
+        "n": secrets.token_hex(8),
+    }
+    body = _b64e(
+        json.dumps(claims, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    sig = _b64e(hmac.new(_hmac_secret(conn), body.encode("ascii"), hashlib.sha256).digest())
+    return f"{body}.{sig}"
+
+
+def _parse_change_token(conn, token: str) -> dict:
+    """校验并解码提交令牌；格式或签名错误一律拒绝（400）。"""
+    parts = token.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ApiError(400, "invalid commit token: malformed")
+    body, sig = parts
+    expected = _b64e(
+        hmac.new(_hmac_secret(conn), body.encode("ascii"), hashlib.sha256).digest()
+    )
+    if not hmac.compare_digest(sig, expected):
+        raise ApiError(400, "invalid commit token: signature mismatch")
+    try:
+        claims = json.loads(_b64d(body))
+    except Exception as exc:
+        raise ApiError(400, "invalid commit token: malformed") from exc
+    for key in ("d", "p", "w", "pl"):
+        if not isinstance(claims.get(key), str):
+            raise ApiError(400, "invalid commit token: malformed claims")
+    return claims
+
+
+def _validate_change(conn, domain: str, delete_ids: list[int], add_windows) -> dict:
+    """校验成组窗口变更请求，返回待删窗口行（按 id）。
+
+    无效区间 → 400；跨域或重复删除 → 400；
+    未知窗口 ID / 未知证书指纹 → 404。
+    """
+    if not delete_ids and not add_windows:
+        raise ApiError(
+            400,
+            "empty window change: at least one window id to delete or one window"
+            " to add is required",
+        )
+    if len(delete_ids) != len(set(delete_ids)):
+        dupes = sorted({wid for wid in delete_ids if delete_ids.count(wid) > 1})
+        raise ApiError(
+            400, f"duplicate window ids in delete_window_ids: {dupes}"
+        )
+
+    rows_by_id: dict[int, object] = {}
+    for wid in set(delete_ids):
+        row = conn.execute(
+            "SELECT * FROM service_windows WHERE id = ?", (wid,)
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, f"unknown service window id {wid}")
+        if row["domain"] != domain:
+            raise ApiError(
+                400,
+                f"window id {wid} belongs to domain '{row['domain']}',"
+                f" not to '{domain}': window changes are scoped to a single domain",
+            )
+        rows_by_id[wid] = row
+
+    for idx, w in enumerate(add_windows, start=1):
+        fp, role, start, end = w
+        if start >= end:
+            raise ApiError(
+                400,
+                f"add_windows[{idx}] invalid time window: start {iso_z(start)}"
+                f" must be before end {iso_z(end)}",
+            )
+        if not conn.execute(
+            "SELECT 1 FROM certificates WHERE fingerprint_sha256 = ?", (fp,)
+        ).fetchone():
+            raise ApiError(
+                404,
+                f"add_windows[{idx}] unknown certificate fingerprint '{fp}'",
+            )
+    return rows_by_id
+
+
+def _candidate_windows(conn, domain: str, delete_ids: set[int], add_windows) -> list:
+    """候选窗口集合 = 该域名现存窗口（剔除待删）+ 待登记窗口（未落库）。"""
+    rows = conn.execute(
+        "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
+        (domain,),
+    ).fetchall()
+    windows = [dict(r) for r in rows if r["id"] not in delete_ids]
+    ts = iso_z(now_utc())
+    for idx, w in enumerate(add_windows, start=1):
+        fp, role, start, end = w
+        windows.append(
+            {
+                "id": f"new-{idx}",
+                "domain": domain,
+                "certificate_fingerprint": fp,
+                "role": role,
+                "start_utc": iso_z(start),
+                "end_utc": iso_z(end),
+                "created_at": ts,
+            }
+        )
+    windows.sort(key=lambda r: (r["start_utc"], str(r["id"])))
+    return windows
+
+
+def _blocking_reasons(evaluation: dict) -> list[str]:
+    seen: set[str] = set()
+    reasons: list[str] = []
+    for cert in evaluation["certificates"]:
+        for reason in cert.get("reasons", []):
+            if reason not in seen:
+                seen.add(reason)
+                reasons.append(reason)
+    return reasons
+
+
+def _recompute_plan(conn, plan, candidate) -> dict:
+    """按计划当前选定的信任根版本与可选 CRL 快照重算（不写历史）。"""
+    return _compute_evaluation(
+        conn,
+        plan["domain"],
+        parse_ts(plan["eval_start"]),
+        parse_ts(plan["eval_end"]),
+        plan["trust_root_version"],
+        plan["crl_snapshot_version"],
+        windows_override=candidate,
+    )
+
+
+def preview_window_change(domain: str, delete_ids: list[int], add_windows) -> dict:
+    """预演按域名的成组窗口增删：不改动窗口、评估或批准历史。
+
+    返回各相关计划变更前后的断档区间与阻断原因，以及提交所需的令牌。
+    """
+    with _write_lock, db.connect() as conn:
+        _validate_change(conn, domain, delete_ids, add_windows)
+        plans = conn.execute(
+            "SELECT * FROM plans WHERE domain = ? ORDER BY id", (domain,)
+        ).fetchall()
+        candidate = _candidate_windows(conn, domain, set(delete_ids), add_windows)
+
+        changes = []
+        blocked = False
+        for plan in plans:
+            before = _compute_evaluation(
+                conn,
+                plan["domain"],
+                parse_ts(plan["eval_start"]),
+                parse_ts(plan["eval_end"]),
+                plan["trust_root_version"],
+                plan["crl_snapshot_version"],
+            )
+            after = _recompute_plan(conn, plan, candidate)
+            approved = plan["status"] == "approved"
+            would_block = approved and after["has_gaps"]
+            blocked = blocked or would_block
+            changes.append(
+                {
+                    "plan_id": plan["id"],
+                    "status": plan["status"],
+                    "trust_root_version": plan["trust_root_version"],
+                    "crl_snapshot_version": plan["crl_snapshot_version"],
+                    "approved": approved,
+                    "would_block": would_block,
+                    "before": {
+                        "has_gaps": before["has_gaps"],
+                        "gaps": before["gaps"],
+                        "blocking_reasons": _blocking_reasons(before),
+                    },
+                    "after": {
+                        "has_gaps": after["has_gaps"],
+                        "gaps": after["gaps"],
+                        "blocking_reasons": _blocking_reasons(after),
+                    },
+                }
+            )
+
+        window_hash = _window_state_hash(conn, domain)
+        plan_hash = _plan_state_hash(conn, domain)
+        token = _issue_change_token(
+            conn, domain, delete_ids, add_windows, window_hash, plan_hash
+        )
+        return {
+            "domain": domain,
+            "delete_window_ids": sorted(set(delete_ids)),
+            "add_windows": [
+                {
+                    "temporary_id": f"new-{idx}",
+                    "certificate_fingerprint": w[0],
+                    "role": w[1],
+                    "start": iso_z(w[2]),
+                    "end": iso_z(w[3]),
+                }
+                for idx, w in enumerate(add_windows, start=1)
+            ],
+            "candidate_windows": [
+                {
+                    "id": w["id"],
+                    "certificate_fingerprint": w["certificate_fingerprint"],
+                    "role": w["role"],
+                    "start": w["start_utc"],
+                    "end": w["end_utc"],
+                }
+                for w in candidate
+            ],
+            "blocked": blocked,
+            "plans": changes,
+            "commit_token": token,
+        }
+
+
+def commit_window_change(domain: str, delete_ids: list[int], add_windows, token: str | None) -> dict:
+    """携带预演令牌原子提交成组窗口增删。
+
+    - 令牌缺失/非法 → 400；载荷不一致或域名窗口/相关计划状态、判定前提已变化
+      （预演过期）→ 409；待删窗口已不存在 → 404；
+    - 候选状态使任一当前已批准计划出现断档 → 整组 409 拒绝，无部分变更；
+    - 否则原子应用全部增删，相关已批准计划转待复核，冻结批准历史保留。
+    """
+    if not token:
+        raise ApiError(
+            400,
+            "commit_token is required: run POST /window-change/preview first",
+        )
+    with _write_lock, db.connect() as conn:
+        claims = _parse_change_token(conn, token)
+        if claims["d"] != domain:
+            raise ApiError(
+                409, "stale window change: token was issued for a different domain"
+            )
+        expected_payload = _canonical_change(domain, delete_ids, add_windows).decode(
+            "utf-8"
+        )
+        if not hmac.compare_digest(claims["p"], expected_payload):
+            raise ApiError(
+                409,
+                "stale window change: change parameters do not match the previewed"
+                " change; re-run preview for the current parameters",
+            )
+
+        # 先判定预演是否过期（窗口/计划状态在预演后已变化）→ 409；
+        # 再校验待删窗口存在性、跨域与区间合法性（404/400）。
+        if claims["w"] != _window_state_hash(conn, domain):
+            raise ApiError(
+                409,
+                "stale window change: domain service windows changed after the"
+                " preview was issued; re-run preview",
+            )
+        if claims["pl"] != _plan_state_hash(conn, domain):
+            raise ApiError(
+                409,
+                "stale window change: a related plan status or evaluation basis"
+                " changed after the preview was issued; re-run preview",
+            )
+
+        rows_by_id = _validate_change(conn, domain, delete_ids, add_windows)
+
+        plans = conn.execute(
+            "SELECT * FROM plans WHERE domain = ? ORDER BY id", (domain,)
+        ).fetchall()
+        candidate = _candidate_windows(conn, domain, set(delete_ids), add_windows)
+        after_by_plan: dict[int, dict] = {}
+        blocking: list[dict] = []
+        for plan in plans:
+            after = _recompute_plan(conn, plan, candidate)
+            after_by_plan[plan["id"]] = after
+            if plan["status"] == "approved" and after["has_gaps"]:
+                blocking.append(
+                    {
+                        "plan_id": plan["id"],
+                        "gaps": after["gaps"],
+                        "blocking_reasons": _blocking_reasons(after),
+                    }
+                )
+        if blocking:
+            raise ApiError(
+                409,
+                "window change rejected: candidate state leaves "
+                f"{len(blocking)} currently approved plan(s) with coverage"
+                f" gaps: {json.dumps(blocking, ensure_ascii=False)}",
+            )
+
+        # 校验通过：同一事务内原子应用全部增删；任何异常均整体回滚。
+        ts = iso_z(now_utc())
+        for wid in set(delete_ids):
+            conn.execute("DELETE FROM service_windows WHERE id = ?", (wid,))
+        added_ids = []
+        for w in add_windows:
+            fp, role, start, end = w
+            cur = conn.execute(
+                "INSERT INTO service_windows"
+                " (domain, certificate_fingerprint, role, start_utc, end_utc, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (domain, fp, role, iso_z(start), iso_z(end), ts),
+            )
+            added_ids.append(cur.lastrowid)
+        marked = _mark_domain_plans_pending_review(conn, domain)
+
+        deleted = [_window_dict(rows_by_id[wid]) for wid in set(delete_ids)]
+        added_rows = conn.execute(
+            "SELECT * FROM service_windows WHERE id IN (%s) ORDER BY id"
+            % ",".join("?" for _ in added_ids),
+            added_ids,
+        ).fetchall() if added_ids else []
+        plans_after = [
+            {
+                "plan_id": plan["id"],
+                "status": (
+                    "pending_review" if plan["status"] == "approved" else plan["status"]
+                ),
+                "has_gaps": after_by_plan[plan["id"]]["has_gaps"],
+                "gaps": after_by_plan[plan["id"]]["gaps"],
+                "blocking_reasons": _blocking_reasons(after_by_plan[plan["id"]]),
+            }
+            for plan in plans
+        ]
+        return {
+            "domain": domain,
+            "applied": True,
+            "deleted_windows": deleted,
+            "added_windows": [_window_dict(r) for r in added_rows],
+            "plans_marked_pending_review": marked,
+            "plans": plans_after,
+        }

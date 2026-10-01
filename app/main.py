@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import db, service
@@ -14,6 +14,8 @@ from .models import (
     PlanCreate,
     ServiceWindowCreate,
     TrustRootImport,
+    WindowChangeRequest,
+    _norm_domain,
 )
 
 API = "/api/v1"
@@ -141,6 +143,70 @@ def list_service_windows(domain: str | None = Query(default=None)):
 @app.delete(f"{API}/service-windows/{{window_id}}", tags=["service-windows"])
 def delete_service_window(window_id: int):
     return service.delete_window(window_id)
+
+
+# --------------------- 按域名成组窗口变更（预演 → 提交） ---------------------
+
+@app.post(f"{API}/domains/{{domain}}/window-change/preview", tags=["window-change"])
+def preview_window_change(domain: str, body: WindowChangeRequest):
+    """预演一次按域名的成组窗口变更（撤下旧窗口 + 登记新窗口）。
+
+    基于候选窗口集合，按每个相关计划当前选定的信任根版本与可选 CRL 快照
+    重算，返回变更前后断档区间与阻断原因；预演不改动窗口、评估或批准历史，
+    并返回提交所需的 commit_token。无效区间/跨域/重复删除 → 400，
+    未知窗口 ID 或证书指纹 → 404，时间戳缺时区 → 422。
+
+    请求体中的 domain 须与路径域名一致（均做归一化）。
+    """
+    try:
+        path_domain = _norm_domain(domain)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.domain != path_domain:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"domain in body '{body.domain}' does not match path domain"
+                f" '{path_domain}'"
+            ),
+        )
+    add_windows = [
+        (w.certificate_fingerprint.lower(), w.role, w.start, w.end)
+        for w in body.add_windows
+    ]
+    return service.preview_window_change(
+        body.domain, body.delete_window_ids, add_windows
+    )
+
+
+@app.post(f"{API}/domains/{{domain}}/window-change/commit", tags=["window-change"])
+def commit_window_change(domain: str, body: WindowChangeRequest):
+    """携带预演令牌原子提交成组窗口增删。
+
+    令牌缺失/非法 → 400；载荷不一致或域名窗口、相关计划状态/判定前提已变化
+    （预演过期）→ 409；候选状态使任一当前已批准计划出现断档时整组拒绝、
+    不产生部分变更（409）；否则原子应用全部增删，相关已批准计划转待复核，
+    历史冻结批准保留。
+    """
+    try:
+        path_domain = _norm_domain(domain)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.domain != path_domain:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"domain in body '{body.domain}' does not match path domain"
+                f" '{path_domain}'"
+            ),
+        )
+    add_windows = [
+        (w.certificate_fingerprint.lower(), w.role, w.start, w.end)
+        for w in body.add_windows
+    ]
+    return service.commit_window_change(
+        body.domain, body.delete_window_ids, add_windows, body.commit_token
+    )
 
 
 # ----------------------------- 计划 / 评估 / 批准 -----------------------------
